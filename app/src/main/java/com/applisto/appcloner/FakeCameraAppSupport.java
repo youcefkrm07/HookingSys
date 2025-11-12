@@ -50,41 +50,35 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
 
             sAppContext = ctx.getApplicationContext();
             INSTANCE = new FakeCameraAppSupport();
-            register(INSTANCE);
-
+            ExecStartActivityHook.register(INSTANCE);
+            
             Log.i(TAG, "FakeCameraAppSupport registered successfully");
         }
     }
 
     @Override
-    protected boolean handle(
-            Context who,
-            IBinder contextThread,
-            IBinder token,
-            Activity target,
-            Intent intent,
-            int requestCode,
-            Bundle options
-    ) {
-        if (intent == null) {
-            return false;
+    protected Instrumentation.ActivityResult onExecStartActivity(ExecStartActivityArgs args) {
+        if (args == null || args.intent == null) {
+            return null;
         }
 
+        Intent intent = args.intent;
         String action = intent.getAction();
-
+        
         // Check if this is a camera intent
         boolean isCameraCapture = MediaStore.ACTION_IMAGE_CAPTURE.equals(action);
         boolean isVideoCapture = MediaStore.ACTION_VIDEO_CAPTURE.equals(action);
 
         if (!isCameraCapture && !isVideoCapture) {
-            return false;
+            // Not a camera intent, let it pass through
+            return null;
         }
 
         // Only intercept if we're in an Activity context
-        Activity activity = findActivity(who, target);
+        Activity activity = findActivity(args.who, args.target);
         if (activity == null) {
             Log.w(TAG, "No activity found for camera intent, not intercepting");
-            return false;
+            return null;
         }
 
         Log.i(TAG, "Intercepting camera intent: " + action + " from " + activity.getClass().getSimpleName());
@@ -92,10 +86,10 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
         synchronized (LOCK) {
             // Store original caller information
             sActivityRef = new WeakReference<>(activity);
-            sRequestCode = requestCode;
+            sRequestCode = args.requestCode;
             sUri = intent.getParcelableExtra(MediaStore.EXTRA_OUTPUT);
             sIsVideoCapture = isVideoCapture;
-
+            
             // Extract camera mode hints if present
             sCameraMode = extractCameraMode(intent);
         }
@@ -104,28 +98,31 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
         Intent fakeCameraIntent = new Intent(activity, FakeCameraActivity.class);
         fakeCameraIntent.putExtra("fake_camera_app", true);
         fakeCameraIntent.putExtra("is_video_capture", isVideoCapture);
-
+        
         if (sUri != null) {
             fakeCameraIntent.putExtra(MediaStore.EXTRA_OUTPUT, sUri);
         }
-
+        
         if (sCameraMode != null) {
             fakeCameraIntent.putExtra("camera_mode", sCameraMode);
         }
 
         try {
-            activity.startActivityForResult(fakeCameraIntent, requestCode);
+            activity.startActivityForResult(fakeCameraIntent, args.requestCode);
             Log.d(TAG, "Launched FakeCameraActivity successfully");
+            
+            // Return a dummy result to indicate we handled it
+            // This prevents the original camera intent from being processed
+            return new Instrumentation.ActivityResult(Activity.RESULT_OK, new Intent());
+            
         } catch (Exception e) {
             Log.e(TAG, "Failed to launch FakeCameraActivity", e);
             synchronized (LOCK) {
                 clearState();
             }
-            return false;
+            // Return null to let the original intent proceed
+            return null;
         }
-
-        // Return true to indicate we handled this intent
-        return true;
     }
 
     /**
@@ -138,9 +135,9 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
             if (facing == 1) return "front";
             if (facing == 0) return "back";
         }
-
+        
         if (intent.hasExtra("android.intent.extra.USE_FRONT_CAMERA")) {
-            return intent.getBooleanExtra("android.intent.extra.USE_FRONT_CAMERA", false)
+            return intent.getBooleanExtra("android.intent.extra.USE_FRONT_CAMERA", false) 
                 ? "front" : "back";
         }
 
@@ -155,11 +152,11 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
         if (target != null) {
             return target;
         }
-
+        
         if (who instanceof Activity) {
             return (Activity) who;
         }
-
+        
         // Try to extract from context
         Context ctx = who;
         while (ctx != null) {
@@ -172,7 +169,7 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
                 break;
             }
         }
-
+        
         return null;
     }
 
@@ -192,7 +189,7 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
                 try {
                     synchronized (LOCK) {
                         Activity activity = sActivityRef != null ? sActivityRef.get() : null;
-
+                        
                         if (activity == null || activity.isFinishing()) {
                             Log.w(TAG, "Activity is gone, cannot deliver result");
                             clearState();
@@ -234,10 +231,10 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
             }
 
             Bitmap transformed = Bitmap.createBitmap(
-                original, 0, 0,
-                original.getWidth(),
-                original.getHeight(),
-                matrix,
+                original, 0, 0, 
+                original.getWidth(), 
+                original.getHeight(), 
+                matrix, 
                 true
             );
 
@@ -284,21 +281,21 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
             if (activity == null) return;
 
             Intent resultIntent = new Intent();
-
+            
             if (thumbnail != null) {
                 // Add thumbnail to extras
                 resultIntent.putExtra("data", thumbnail);
             }
-
+            
             if (sUri != null) {
                 resultIntent.setData(sUri);
             }
 
-            // Use reflection to call setResult and finish
+            // Use reflection to call setResult
             try {
                 Method setResult = Activity.class.getMethod("setResult", int.class, Intent.class);
                 setResult.invoke(activity, Activity.RESULT_OK, resultIntent);
-
+                
                 Log.i(TAG, "Delivered RESULT_OK to activity");
             } catch (Exception e) {
                 Log.e(TAG, "Failed to deliver result via reflection", e);
