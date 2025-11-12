@@ -18,159 +18,354 @@ import java.io.InputStream;
 public class FakeCameraActivity extends Activity {
     private static final String TAG = "FakeCameraActivity";
     private static final int REQ_PICK_IMAGE = 1001;
+    private static final int MAX_IMAGE_SIZE = 2048; // Max dimension
 
-    private String modeExtra;          // "selfie", "front", "back" (may be null)
-    private boolean usedOpenDocument;  // track which picker path we launched
-    private boolean isFakeCameraAppMode;  // From "fake_camera_app" extra
+    private String cameraMode;
+    private boolean usedOpenDocument;
+    private boolean isFakeCameraAppMode;
+    private boolean isVideoCapture;
+    private Uri outputUri;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // Optional: ensure hooks exist if launched directly
-        try { CameraHook.install(getApplicationContext()); } catch (Throwable ignored) {}
-
-        modeExtra = getIntent() != null ? getIntent().getStringExtra("mode") : null;
-        isFakeCameraAppMode = getIntent() != null && getIntent().getBooleanExtra("fake_camera_app", false);
-        Log.d(TAG, "Received mode from intent: " + modeExtra + ", fake_camera_app: " + isFakeCameraAppMode);
-        Log.d(TAG, "Intent extras: " + (getIntent() != null ? getIntent().getExtras() : "null"));
-
+        // Ensure CameraHook is installed
         try {
-            Intent intent;
-            if (Build.VERSION.SDK_INT >= 33) {
-                // Android 13+ system photo picker
-                intent = new Intent("android.provider.action.PICK_IMAGES");
-                intent.putExtra("android.provider.extra.ALLOW_MULTIPLE", false);  // Enforce single selection
-                usedOpenDocument = false;
-            } else {
-                // Storage Access Framework
-                intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-                intent.addCategory(Intent.CATEGORY_OPENABLE);
-                intent.setType("image/*");
+            CameraHook.install(getApplicationContext());
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to install CameraHook", e);
+        }
+
+        // Parse intent extras
+        Intent intent = getIntent();
+        if (intent != null) {
+            isFakeCameraAppMode = intent.getBooleanExtra("fake_camera_app", false);
+            isVideoCapture = intent.getBooleanExtra("is_video_capture", false);
+            cameraMode = intent.getStringExtra("camera_mode");
+            outputUri = intent.getParcelableExtra(MediaStore.EXTRA_OUTPUT);
+
+            Log.d(TAG, "Started with mode=" + cameraMode + ", video=" + isVideoCapture + ", uri=" + outputUri);
+        }
+
+        if (isVideoCapture) {
+            // For now, video capture is not supported
+            Toast.makeText(this, "Video capture not yet supported", Toast.LENGTH_SHORT).show();
+            setResult(RESULT_CANCELED);
+            finish();
+            return;
+        }
+
+        // Launch image picker
+        launchImagePicker();
+    }
+
+    /**
+     * Launch the appropriate image picker
+     */
+    private void launchImagePicker() {
+        try {
+            Intent pickIntent;
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+                // Use ACTION_OPEN_DOCUMENT for newer Android versions
+                pickIntent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
+                pickIntent.addCategory(Intent.CATEGORY_OPENABLE);
+                pickIntent.setType("image/*");
                 usedOpenDocument = true;
+            } else {
+                // Fallback to ACTION_PICK for older versions
+                pickIntent = new Intent(Intent.ACTION_PICK);
+                pickIntent.setType("image/*");
+                pickIntent.setData(MediaStore.Images.Media.EXTERNAL_CONTENT_URI);
+                usedOpenDocument = false;
             }
-            //noinspection deprecation
-            startActivityForResult(intent, REQ_PICK_IMAGE);
-        } catch (Throwable t) {
-            Log.e(TAG, "Failed to launch image picker", t);
-            Toast.makeText(this, "Unable to open image picker", Toast.LENGTH_SHORT).show();
+
+            // Add hint for camera mode if available
+            if (cameraMode != null) {
+                pickIntent.putExtra("camera_mode_hint", cameraMode);
+            }
+
+            startActivityForResult(pickIntent, REQ_PICK_IMAGE);
+            Log.d(TAG, "Launched image picker (openDocument=" + usedOpenDocument + ")");
+
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to launch image picker", e);
+            Toast.makeText(this, "Failed to open image picker", Toast.LENGTH_SHORT).show();
+            setResult(RESULT_CANCELED);
             finish();
         }
     }
 
     @Override
-    @SuppressWarnings("deprecation")
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
 
+        Log.d(TAG, "onActivityResult: request=" + requestCode + ", result=" + resultCode);
+
         if (requestCode != REQ_PICK_IMAGE) {
-            finish();
-            return;
-        }
-        if (resultCode != RESULT_OK || data == null || data.getData() == null) {
-            Toast.makeText(this, "No image selected", Toast.LENGTH_SHORT).show();
-            finish();
             return;
         }
 
-        Uri uri = data.getData();
+        if (resultCode != RESULT_OK || data == null) {
+            Log.w(TAG, "User cancelled or no data returned");
 
-        // Persist access for ACTION_OPEN_DOCUMENT path
-        if (usedOpenDocument && Build.VERSION.SDK_INT >= 19) {
-            final int flags = data.getFlags()
-                    & (Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
-            try {
-                getContentResolver().takePersistableUriPermission(uri, flags);
-            } catch (SecurityException ignored) {}
+            if (isFakeCameraAppMode) {
+                FakeCameraAppSupport.onImageSelected(null);
+            } else {
+                setResult(RESULT_CANCELED);
+            }
+            finish();
+            return;
         }
 
-        Bitmap selected = null;
-        String resolvedMode = modeExtra != null ? modeExtra : "front";  // Default
-        if (isFakeCameraAppMode) {
-            resolvedMode = "app";  // Or resolve via CameraHook state
-            Log.d(TAG, "Using app-clone mode for bitmap set");
+        // Process selected image in background
+        final Uri selectedUri = data.getData();
+        if (selectedUri == null) {
+            Log.e(TAG, "No URI in result data");
+            handleError("No image selected");
+            return;
         }
+
+        Log.i(TAG, "Image selected: " + selectedUri);
+
+        // Process image in background thread
+        new Thread(new Runnable() {
+            @Override
+            public void run() {
+                processSelectedImage(selectedUri);
+            }
+        }).start();
+    }
+
+    /**
+     * Process the selected image (load, transform, deliver)
+     */
+    private void processSelectedImage(Uri uri) {
+        Bitmap bitmap = null;
+
         try {
-            // 1) Probe bounds and pick a safe inSampleSize
-            BitmapFactory.Options bounds = new BitmapFactory.Options();
-            bounds.inJustDecodeBounds = true;
-            try (InputStream is = getContentResolver().openInputStream(uri)) {
-                BitmapFactory.decodeStream(is, null, bounds);
-            }
-            int srcW = Math.max(1, bounds.outWidth);
-            int srcH = Math.max(1, bounds.outHeight);
+            // Load bitmap from URI
+            bitmap = loadBitmapFromUri(uri);
 
-            final int maxDim = 2048; // keep memory reasonable
-            int sample = 1;
-            while ((srcW / sample) > maxDim || (srcH / sample) > maxDim) {
-                sample <<= 1;
-            }
-
-            // 2) Decode with sampling
-            BitmapFactory.Options opts = new BitmapFactory.Options();
-            opts.inSampleSize = sample;
-            opts.inPreferredConfig = Bitmap.Config.ARGB_8888;
-            opts.inDither = false;
-            opts.inScaled = false;
-            try (InputStream is2 = getContentResolver().openInputStream(uri)) {
-                selected = BitmapFactory.decodeStream(is2, null, opts);
-            }
-
-            if (selected == null) {
-                Log.e(TAG, "Decoded bitmap is null");
-                Toast.makeText(this, "Failed to decode image", Toast.LENGTH_SHORT).show();
-                // Inform the FakeCameraAppSupport that selection failed
-                FakeCameraAppSupport.setImage(null, null);
-                finish();
+            if (bitmap == null) {
+                handleError("Failed to load image");
                 return;
             }
 
-            // 3) Optionally transform the bitmap: mirror for front/selfie cameras
-            boolean transformed = false;
-            if ("selfie".equalsIgnoreCase(modeExtra) || "front".equalsIgnoreCase(modeExtra)) {
-                Matrix m = new Matrix();
-                m.preScale(-1f, 1f); // mirror horizontally
-                Bitmap mirrored = Bitmap.createBitmap(selected, 0, 0, selected.getWidth(), selected.getHeight(), m, true);
-                if (mirrored != null) {
-                    selected.recycle();
-                    selected = mirrored;
-                    transformed = true;
-                }
-            }
+            Log.d(TAG, "Loaded bitmap: " + bitmap.getWidth() + "x" + bitmap.getHeight());
 
-            // You can add rotation handling based on EXIF here if desired.
+            // Scale down if too large
+            bitmap = scaleBitmapIfNeeded(bitmap);
 
-            // 4) Compress to JPEG bytes and hand off to FakeCameraAppSupport which will write
-            ByteArrayOutputStream baos = new ByteArrayOutputStream();
-            final int jpegQuality = 95;
-            boolean compressOk = selected.compress(Bitmap.CompressFormat.JPEG, jpegQuality, baos);
-            byte[] jpegBytes = null;
-            if (compressOk) {
-                jpegBytes = baos.toByteArray();
+            // Apply transformations from CameraHook
+            bitmap = applyHookTransformations(bitmap);
+
+            // Deliver result
+            if (isFakeCameraAppMode) {
+                // Let FakeCameraAppSupport handle delivery
+                FakeCameraAppSupport.onImageSelected(bitmap);
+                finishOnUiThread();
             } else {
-                Log.e(TAG, "Failed to compress selected bitmap to JPEG");
-            }
-
-            if (jpegBytes != null) {
-                // Pass JPEG bytes to FakeCameraAppSupport which will write them to the saved output Uri.
-                FakeCameraAppSupport.setImage(null, jpegBytes);
-                Toast.makeText(this, "Image selected", Toast.LENGTH_SHORT).show();
-            } else {
-                // Fallback: tell support there's no image (will deliver canceled result)
-                FakeCameraAppSupport.setImage(null, null);
-                Toast.makeText(this, "Failed to prepare image", Toast.LENGTH_SHORT).show();
+                // Direct mode: deliver result ourselves
+                deliverResult(bitmap);
             }
 
         } catch (Exception e) {
-            Log.e(TAG, "Error processing selected image", e);
-            Toast.makeText(this, "Error processing image", Toast.LENGTH_SHORT).show();
-            FakeCameraAppSupport.setImage(null, null);
+            Log.e(TAG, "Error processing image", e);
+            handleError("Error processing image: " + e.getMessage());
         } finally {
-            if (selected != null && !selected.isRecycled()) {
-                try { selected.recycle(); } catch (Throwable ignored) {}
+            // Don't recycle here if we passed it to FakeCameraAppSupport
+            if (bitmap != null && !isFakeCameraAppMode) {
+                bitmap.recycle();
             }
-            // We are done — finish this picker activity
-            finish();
         }
+    }
+
+    /**
+     * Load bitmap from URI with proper error handling
+     */
+    private Bitmap loadBitmapFromUri(Uri uri) {
+        InputStream input = null;
+        try {
+            input = getContentResolver().openInputStream(uri);
+            if (input == null) {
+                Log.e(TAG, "Failed to open input stream for URI: " + uri);
+                return null;
+            }
+
+            // Decode bitmap
+            BitmapFactory.Options options = new BitmapFactory.Options();
+            options.inPreferredConfig = Bitmap.Config.ARGB_8888;
+
+            Bitmap bitmap = BitmapFactory.decodeStream(input, null, options);
+
+            if (bitmap == null) {
+                Log.e(TAG, "BitmapFactory returned null for URI: " + uri);
+            }
+
+            return bitmap;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Exception loading bitmap from URI: " + uri, e);
+            return null;
+        } finally {
+            if (input != null) {
+                try {
+                    input.close();
+                } catch (Exception ignored) {}
+            }
+        }
+    }
+
+    /**
+     * Scale bitmap if it exceeds maximum dimensions
+     */
+    private Bitmap scaleBitmapIfNeeded(Bitmap original) {
+        int width = original.getWidth();
+        int height = original.getHeight();
+
+        if (width <= MAX_IMAGE_SIZE && height <= MAX_IMAGE_SIZE) {
+            return original;
+        }
+
+        float scale = Math.min(
+            (float) MAX_IMAGE_SIZE / width,
+            (float) MAX_IMAGE_SIZE / height
+        );
+
+        int newWidth = Math.round(width * scale);
+        int newHeight = Math.round(height * scale);
+
+        Log.d(TAG, "Scaling bitmap from " + width + "x" + height + " to " + newWidth + "x" + newHeight);
+
+        Bitmap scaled = Bitmap.createScaledBitmap(original, newWidth, newHeight, true);
+
+        if (scaled != original) {
+            original.recycle();
+        }
+
+        return scaled;
+    }
+
+    /**
+     * Apply transformations from CameraHook
+     */
+    private Bitmap applyHookTransformations(Bitmap original) {
+        try {
+            Matrix matrix = CameraHook.getTransformationMatrix();
+
+            if (matrix == null || matrix.isIdentity()) {
+                return original;
+            }
+
+            Log.d(TAG, "Applying CameraHook transformations");
+
+            Bitmap transformed = Bitmap.createBitmap(
+                original, 0, 0,
+                original.getWidth(),
+                original.getHeight(),
+                matrix,
+                true
+            );
+
+            if (transformed != original) {
+                original.recycle();
+            }
+
+            return transformed;
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error applying transformations", e);
+            return original;
+        }
+    }
+
+    /**
+     * Deliver result in direct mode (not using FakeCameraAppSupport)
+     */
+    private void deliverResult(final Bitmap bitmap) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Intent resultIntent = new Intent();
+
+                    if (outputUri != null) {
+                        // Save to specified URI
+                        saveBitmapToUri(bitmap, outputUri);
+                        resultIntent.setData(outputUri);
+                    } else {
+                        // Return as thumbnail
+                        resultIntent.putExtra("data", bitmap);
+                    }
+
+                    setResult(RESULT_OK, resultIntent);
+                    Log.i(TAG, "Result delivered successfully");
+
+                } catch (Exception e) {
+                    Log.e(TAG, "Error delivering result", e);
+                    setResult(RESULT_CANCELED);
+                } finally {
+                    finish();
+                }
+            }
+        });
+    }
+
+    /**
+     * Save bitmap to URI
+     */
+    private void saveBitmapToUri(Bitmap bitmap, Uri uri) {
+        try {
+            java.io.OutputStream out = getContentResolver().openOutputStream(uri);
+            if (out != null) {
+                bitmap.compress(Bitmap.CompressFormat.JPEG, 90, out);
+                out.flush();
+                out.close();
+                Log.d(TAG, "Saved bitmap to URI: " + uri);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to save bitmap to URI", e);
+            throw new RuntimeException("Failed to save image", e);
+        }
+    }
+
+    /**
+     * Handle errors by showing toast and finishing
+     */
+    private void handleError(final String message) {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                Toast.makeText(FakeCameraActivity.this, message, Toast.LENGTH_SHORT).show();
+
+                if (isFakeCameraAppMode) {
+                    FakeCameraAppSupport.onImageSelected(null);
+                } else {
+                    setResult(RESULT_CANCELED);
+                }
+
+                finish();
+            }
+        });
+    }
+
+    /**
+     * Finish on UI thread
+     */
+    private void finishOnUiThread() {
+        runOnUiThread(new Runnable() {
+            @Override
+            public void run() {
+                finish();
+            }
+        });
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        Log.d(TAG, "Activity destroyed");
     }
 }
