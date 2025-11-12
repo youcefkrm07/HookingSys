@@ -11,18 +11,29 @@ import android.os.Looper;
 import android.provider.MediaStore;
 import android.util.Log;
 
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.lang.reflect.Method;
+import java.lang.ref.WeakReference;
 
+/**
+ * Updated FakeCameraAppSupport:
+ * - Uses WeakReference to avoid leaking Activity
+ * - Supports immediate return of a preconfigured fake image (filesDir/fake_camera.jpg)
+ * - Keeps compatibility with ExecStartActivityHook instrumentation wrapper
+ */
 public final class FakeCameraAppSupport extends ExecStartActivityHook {
     private static final String TAG = "FakeCameraAppSupport";
 
-    // Runtime state for returning a result to the original caller
-    private static Activity sActivity;
-    private static int      sRequestCode;
-    private static Uri      sUri;
+    // Use WeakReference to avoid leaks and hold result state
+    private static WeakReference<Activity> sActivityRef;
+    private static int sRequestCode;
+    private static Uri sUri;
 
-    private static FakeCameraAppSupport INSTANCE;
+    private static volatile FakeCameraAppSupport INSTANCE;
+    private static final Object LOCK = new Object();
 
     /** Call this once early (e.g., Application.onCreate). */
     public static void setup(Context ctx) {
@@ -30,13 +41,20 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
             Log.d(TAG, "FakeCameraAppSupport already setup");
             return;
         }
-        INSTANCE = new FakeCameraAppSupport();
-        INSTANCE.install(ctx);   // registers into execStartActivity chain
+        synchronized (LOCK) {
+            if (INSTANCE != null) return;
+            INSTANCE = new FakeCameraAppSupport();
+            INSTANCE.install(ctx);   // registers into execStartActivity chain
 
-        // Ensure CameraHook is also installed
-        CameraHook.install(ctx);
+            // Ensure CameraHook is also installed
+            try {
+                CameraHook.install(ctx);
+            } catch (Throwable t) {
+                Log.e(TAG, "Failed to install CameraHook", t);
+            }
 
-        Log.i(TAG, "FakeCameraAppSupport installed successfully");
+            Log.i(TAG, "FakeCameraAppSupport installed successfully");
+        }
     }
 
     @Override
@@ -68,9 +86,22 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
         Log.i(TAG, "INTERCEPTING CAMERA INTENT with output: " + output);
 
         // Remember for result delivery
-        sActivity    = caller;
+        sActivityRef = new WeakReference<>(caller);
         sRequestCode = args.requestCode;
-        sUri         = output;
+        sUri = output;
+
+        // If a pre-configured fake image exists, return it immediately
+        try {
+            File fakeImage = new File(args.who.getFilesDir(), "fake_camera.jpg");
+            if (fakeImage.exists()) {
+                Log.i(TAG, "Found preconfigured fake image; returning immediately");
+                returnFakeImageResult(args.who);
+                Log.i(TAG, "VETOING REAL CAMERA LAUNCH (immediate fake)");
+                return false;
+            }
+        } catch (Throwable t) {
+            Log.e(TAG, "Error checking for fake image", t);
+        }
 
         // Launch our picker UI
         try {
@@ -82,7 +113,6 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
             fake.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
             caller.startActivity(fake);
 
-            // REMOVED: showTempNotification(caller); // This was causing the crash
             Log.i(TAG, "Fake picker launched successfully - CAMERA INTERCEPTED");
 
         } catch (ClassNotFoundException e) {
@@ -105,7 +135,7 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
         Log.d(TAG, "isCameraCapture: action=" + a);
 
         if (MediaStore.ACTION_IMAGE_CAPTURE.equals(a) ||
-            "android.media.action.IMAGE_CAPTURE_SECURE".equals(a)) {
+                "android.media.action.IMAGE_CAPTURE_SECURE".equals(a)) {
             Uri output = i.getParcelableExtra(MediaStore.EXTRA_OUTPUT);
             Log.d(TAG, "isCameraCapture: output Uri=" + output);
             return output != null;
@@ -123,7 +153,7 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
         return false;
     }
 
-    /** Called by FakeCameraActivity after user selects an image. */
+    /** Called by FakeCameraActivity after user selects an image or by returnFakeImageResult. */
     public static void setImage(final Bitmap bmp, final byte[] jpegBytes) {
         if (bmp == null && jpegBytes == null) {
             Log.w(TAG, "setImage: no data");
@@ -132,7 +162,7 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
             return;
         }
 
-        final Activity caller = sActivity;
+        final Activity caller = sActivityRef != null ? sActivityRef.get() : null;
         final Uri outputUri = sUri;
         final int requestCode = sRequestCode;
 
@@ -189,7 +219,7 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
                     deliverResultToActivity(caller, requestCode, success ? Activity.RESULT_OK : Activity.RESULT_CANCELED, outputUri);
                 }
                 // Clear saved state regardless
-                sActivity = null;
+                sActivityRef = null;
                 sRequestCode = 0;
                 sUri = null;
             });
@@ -216,7 +246,7 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
 
     // Convenience helper to deliver a simple success/cancel result using saved state.
     private static void deliverResult(final boolean success) {
-        final Activity caller = sActivity;
+        final Activity caller = sActivityRef != null ? sActivityRef.get() : null;
         final int requestCode = sRequestCode;
         final Uri outputUri = sUri;
 
@@ -227,10 +257,58 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
                 Log.w(TAG, "deliverResult: caller Activity is null; nothing to deliver");
             }
             // Clear saved state
-            sActivity = null;
+            sActivityRef = null;
             sRequestCode = 0;
             sUri = null;
         });
+    }
+
+    /**
+     * If a file named "fake_camera.jpg" exists in the app's files directory, copy it to the
+     * saved EXTRA_OUTPUT Uri and deliver RESULT_OK to the original caller, without launching
+     * the picker UI.
+     */
+    private static void returnFakeImageResult(Context ctx) {
+        try {
+            File fakeImage = new File(ctx.getFilesDir(), "fake_camera.jpg");
+            if (!fakeImage.exists()) {
+                Log.w(TAG, "returnFakeImageResult: fake image not found");
+                deliverResult(false);
+                return;
+            }
+            byte[] bytes = readAllBytes(fakeImage);
+            if (bytes == null || bytes.length == 0) {
+                Log.e(TAG, "returnFakeImageResult: failed to read fake image bytes");
+                deliverResult(false);
+                return;
+            }
+            // Reuse setImage path which writes to the stored output Uri and delivers result
+            setImage(null, bytes);
+        } catch (Throwable t) {
+            Log.e(TAG, "returnFakeImageResult: unexpected error", t);
+            deliverResult(false);
+        }
+    }
+
+    private static byte[] readAllBytes(File f) {
+        FileInputStream fis = null;
+        ByteArrayOutputStream baos = null;
+        try {
+            fis = new FileInputStream(f);
+            baos = new ByteArrayOutputStream((int) Math.min(f.length(), Integer.MAX_VALUE));
+            byte[] buf = new byte[8192];
+            int r;
+            while ((r = fis.read(buf)) != -1) {
+                baos.write(buf, 0, r);
+            }
+            return baos.toByteArray();
+        } catch (Exception e) {
+            Log.e(TAG, "readAllBytes failed", e);
+            return null;
+        } finally {
+            if (fis != null) try { fis.close(); } catch (Exception ignored) {}
+            if (baos != null) try { baos.close(); } catch (Exception ignored) {}
+        }
     }
 
     // Optional: small fallback to obtain a Context if caller is null.
@@ -241,5 +319,13 @@ public final class FakeCameraAppSupport extends ExecStartActivityHook {
             // otherwise return null. Replace with your actual application context accessor.
             return null;
         }
+    }
+
+    /** Cleanup any saved state. */
+    public static void cleanup() {
+        sActivityRef = null;
+        sRequestCode = 0;
+        sUri = null;
+        Log.i(TAG, "FakeCameraAppSupport cleaned up");
     }
 }
