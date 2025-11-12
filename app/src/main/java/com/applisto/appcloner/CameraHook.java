@@ -54,6 +54,50 @@ public final class CameraHook {
     private static final long NOTIF_DEBOUNCE_MS = 5000;
     private static final boolean GLARE_AVOIDANCE = true;
 
+    // Add to CameraHook class
+
+private static Matrix sTransformationMatrix = new Matrix();
+private static final Object MATRIX_LOCK = new Object();
+
+/**
+ * Get the current transformation matrix for image processing
+ */
+public static Matrix getTransformationMatrix() {
+    synchronized (MATRIX_LOCK) {
+        return new Matrix(sTransformationMatrix);
+    }
+}
+
+/**
+ * Reset transformation matrix to identity
+ */
+public static void resetTransformations() {
+    synchronized (MATRIX_LOCK) {
+        sTransformationMatrix.reset();
+    }
+}
+
+/**
+ * Apply rotation to transformation matrix
+ */
+public static void applyRotation(float degrees) {
+    synchronized (MATRIX_LOCK) {
+        sTransformationMatrix.postRotate(degrees);
+        Log.d(TAG, "Applied rotation: " + degrees + " degrees");
+    }
+}
+
+/**
+ * Apply flip to transformation matrix
+ */
+public static void applyFlip(boolean horizontal, boolean vertical) {
+    synchronized (MATRIX_LOCK) {
+        float scaleX = horizontal ? -1.0f : 1.0f;
+        float scaleY = vertical ? -1.0f : 1.0f;
+        sTransformationMatrix.postScale(scaleX, scaleY);
+        Log.d(TAG, "Applied flip: horizontal=" + horizontal + ", vertical=" + vertical);
+    }
+}
     // Zoom tunables
     private static final float ZOOM_STEP_IN = 1.15f;
     private static final float ZOOM_STEP_OUT = 1f / ZOOM_STEP_IN;
